@@ -18,7 +18,7 @@ Put the PDF files you want to split in the `data` directory, then run:
 uv run main.py
 ```
 
-The script writes one PDF per page into `data`, with filenames in the form `original_name_page_1.pdf`.
+The script reads PDFs from `data` and writes one PDF per page into `data/data`, with filenames in the form `original_name_page_1.pdf`. It ignores non-PDF files such as `.DS_Store` and creates the output folder when needed.
 
 If `uv` is not on your shell's `PATH`, install it first or use the Python interpreter from the environment created by uv:
 
