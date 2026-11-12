@@ -10,15 +10,17 @@ uv sync
 
 This creates the project environment, updates `uv.lock` if needed, and installs the dependencies declared in `pyproject.toml`. You do not need to install them separately with `pip`.
 
-## Run
+## Extract PDF tables to CSV
 
-Put the PDF files you want to split in the `data` directory, then run:
+Put text-based PDF files with tables in the `data` directory, then run:
 
 ```sh
 uv run main.py
 ```
 
-The script reads PDFs from `data` and writes one PDF per page into `data/data`, with filenames in the form `original_name_page_1.pdf`. It ignores non-PDF files such as `.DS_Store` and creates the output folder when needed.
+The script uses Microsoft's Hugging Face Table Transformer models to locate tables and detect their rows and columns, then uses selectable PDF text to populate the cells. It writes one CSV per source PDF under `data/csv`. The models download on first use and are cached by Hugging Face.
+
+Scanned PDFs do not contain selectable text, so this version reports that no table rows could be extracted. They need an OCR step before the text can be placed into CSV cells. Table layouts with merged cells or irregular formatting may also need document-specific handling.
 
 If `uv` is not on your shell's `PATH`, install it first or use the Python interpreter from the environment created by uv:
 
@@ -26,4 +28,4 @@ If `uv` is not on your shell's `PATH`, install it first or use the Python interp
 uv run python main.py
 ```
 
-If you see `ModuleNotFoundError: No module named 'PyPDF2'`, run `uv sync` from the project directory, then try `uv run main.py` again. The project declares the `pypdf2` distribution that provides the `PyPDF2` import.
+If dependencies changed, run `uv sync` from the project directory, then try `uv run main.py` again.
