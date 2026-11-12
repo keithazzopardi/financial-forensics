@@ -10,17 +10,23 @@ uv sync
 
 This creates the project environment, updates `uv.lock` if needed, and installs the dependencies declared in `pyproject.toml`. You do not need to install them separately with `pip`.
 
-## Extract PDF tables to CSV
+## Extract bank statement transactions to JSON
 
-Put text-based PDF files with tables in the `data` directory, then run:
+Put PDF files in `data/splitted`, then run:
 
 ```sh
 uv run main.py
 ```
 
-The script uses Microsoft's Hugging Face Table Transformer models to locate tables and detect their rows and columns, then uses selectable PDF text to populate the cells. It writes one CSV per source PDF under `data/csv`. The models download on first use and are cached by Hugging Face.
+The script loads the cached `ByteDance/Dolphin-v2` model locally, renders each PDF page, and extracts the statement fields and transactions. It writes one formatted JSON file per PDF under `data/splitted/json`, using the same filename stem as the PDF. Each JSON object contains the statement start date, end date, IBAN, and a `Transactions` array with each transaction's date, description, debit/credit operation, amount, and balance after. No `HF_TOKEN` or hosted inference service is used.
 
-Scanned PDFs do not contain selectable text, so this version reports that no table rows could be extracted. They need an OCR step before the text can be placed into CSV cells. Table layouts with merged cells or irregular formatting may also need document-specific handling.
+If the model is not in the Hugging Face cache yet, download it once with:
+
+```sh
+hf download ByteDance/Dolphin-v2
+```
+
+The Hugging Face model card currently identifies Dolphin-v2 as a 4B parameter BF16 model. The downloaded weights and memory needed at runtime can therefore exceed 2 GB; a 2 GB limit is not enough for this model in its standard form. Review the generated JSON against the original statement before relying on extracted financial values.
 
 If `uv` is not on your shell's `PATH`, install it first or use the Python interpreter from the environment created by uv:
 
