@@ -1,4 +1,7 @@
 from PyPDF2 import PdfReader, PdfWriter
+from os import listdir
+from os.path import isfile, join
+
 
 def print_log(name):
     print(f'{name}')  # Press ⌘F8 to toggle the breakpoint.
@@ -22,5 +25,11 @@ def split_pdf(folder_path, file_name):
 
 # Press the green button in the gutter to run the script.
 if __name__ == '__main__':
+     path: str =  './data'
+     onlyfiles = [f for f in listdir(path) if isfile(join(path, f))]
+
+    for file_name in onlyfiles:
+        split_pdf(path, file_name)
+
 
 
