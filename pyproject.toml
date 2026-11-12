@@ -1,0 +1,7 @@
+[project]
+name = "financial_forensics"
+version = "0.1.0"
+requires-python = ">=3.15"
+dependencies = [
+    "pdf2image>=1.17.0",
+]
