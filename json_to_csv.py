@@ -13,7 +13,14 @@ from typing import Any
 
 TRANSACTION_FIELDS = ("Date", "Description", "Operation", "Amount", "Balance after")
 CSV_FIELDS = ("IBAN", "Start date", "End Date", *TRANSACTION_FIELDS, "Source file")
-EXCLUDED_JSON_PREFIXES = ("11.2026.6_page_1",)
+EXCLUDED_JSON_PREFIXES = (
+    "11.2026.6_page_1",
+    "11.2026.4_page_5"
+    "11.2026.6_page_3",
+    "11.2026.6_page_4",
+    "11.2026.6_page_5",
+    "11.2026.6_page_6"
+)
 IBAN_REPAIRS = {
     "MT80VALL2201300000004001999971": "MT80VALL22013000000040019999971",
     "11111111111111111111": "MT88VALL22013000000017000277017",
