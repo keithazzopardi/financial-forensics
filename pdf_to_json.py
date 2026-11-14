@@ -15,6 +15,7 @@ from transformers import AutoModelForMultimodalLM, AutoProcessor
 
 
 MODEL_ID = "Qwen/Qwen3.5-4B"
+EXCLUDED_PDF_PREFIXES = ("11.2026.3_page_1", "11.2026.2", "11.2026.1")
 STATEMENT_FIELDS = ("Start date", "End Date", "IBAN")
 TRANSACTION_FIELDS = ("Date", "Description", "Operation", "Amount", "Balance after")
 PROMPT = """Read this bank-statement page and extract its statement period, full IBAN, and transaction table.
@@ -25,13 +26,20 @@ Return only valid JSON in exactly this shape:
     {"date": "", "description": "", "operation": "Debit or Credit", "amount": "", "balance_after": ""}
   ]
 }
-Use exactly Debit or Credit for operation based on the statement columns. Keep printed
+Use exactly Debit or Credit for operation based on the statement columns. Keep the
 dates and amounts, and combine wrapped description lines. The statement period may look
 like "25 DEC 18 - 20 JUN 19": put the first date in start_date and the second in end_date.
 Extract the complete Maltese IBAN as printed (it may begin with MT96VALL22; this is only
 an example prefix, not the full IBAN). Do not include account-holder details, opening or
 closing balance lines, or page footers as transactions. Do not invent repeated values or
-guess missing characters. If a value is unclear, use an empty string. Return JSON only."""
+guess missing characters. 
+
+Some documents labeled as `Statement of Account` will have a slightly different format.
+There are Withdrawal and Deposit columns. Map these to Debit and Credit accordingly. 
+This will also have `Balance in EUR`. Map this to `balance_after`. The date for this type
+of document will be in this format 12.04.2020. 
+
+If a value is unclear, use an empty string. Return JSON only."""
 
 
 def load_model() -> tuple[Any, Any]:
@@ -138,16 +146,20 @@ def extract_page(
 
 def convert_pdf(
     processor: Any, model: Any, pdf_path: Path, output_path: Path
-) -> int:
+) -> tuple[int, list[str]]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     statement = dict.fromkeys(STATEMENT_FIELDS, "")
     transactions: list[dict[str, str]] = []
+    page_errors: list[str] = []
     with fitz.open(pdf_path) as pdf:
         for page_number, page in enumerate(pdf, start=1):
             try:
                 page_statement, page_transactions = extract_page(processor, model, page)
             except Exception as error:
-                raise RuntimeError(f"Failed to extract page {page_number} of {pdf_path}") from error
+                message = f"Page {page_number}: {type(error).__name__}: {error}"
+                page_errors.append(message)
+                print(f"Failed to extract {pdf_path} {message}")
+                continue
             for field in STATEMENT_FIELDS:
                 if not statement[field] and page_statement[field]:
                     statement[field] = page_statement[field]
@@ -157,17 +169,36 @@ def convert_pdf(
     with output_path.open("w", encoding="utf-8") as json_file:
         json.dump(result, json_file, indent=2, ensure_ascii=False)
         json_file.write("\n")
-    return len(transactions)
+    return len(transactions), page_errors
 
 
-def convert_folder(input_dir: Path, output_dir: Path) -> None:
-    pdf_files = sorted(path for path in input_dir.glob("*.pdf") if path.is_file())
+def convert_folder_pdf_to_json(input_dir: Path, output_dir: Path) -> None:
+    pdf_files = sorted(
+        path
+        for path in input_dir.glob("*.pdf")
+        if path.is_file()
+        and not path.stem.startswith(EXCLUDED_PDF_PREFIXES)
+    )
     if not pdf_files:
         print(f"No PDF files found in {input_dir}")
         return
 
     processor, model = load_model()
+    failed_files: list[tuple[Path, str]] = []
     for pdf_path in pdf_files:
         json_path = output_dir / f"{pdf_path.stem}.json"
-        count = convert_pdf(processor, model, pdf_path, json_path)
-        print(f"Saved {count} transactions to {json_path}")
+        try:
+            count, page_errors = convert_pdf(processor, model, pdf_path, json_path)
+            status = f"with {len(page_errors)} failed page(s)" if page_errors else ""
+            print(f"Saved {count} transactions to {json_path} {status}".rstrip())
+            if page_errors:
+                failed_files.append((pdf_path, "; ".join(page_errors)))
+        except Exception as error:
+            message = f"{type(error).__name__}: {error}"
+            failed_files.append((pdf_path, message))
+            print(f"Failed to process {pdf_path}: {message}")
+
+    if failed_files:
+        print(f"Completed with errors in {len(failed_files)} PDF(s):")
+        for pdf_path, message in failed_files:
+            print(f"  {pdf_path}: {message}")
