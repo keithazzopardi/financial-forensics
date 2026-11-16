@@ -8,11 +8,12 @@ from pathlib import Path
 
 
 PEOPLE = (
-    "MARYSE ANN",
-    "DIANE AZZOPARDI",
-    "KEITH AZZOPARDI",
-    "NICOLE AZZOPARDI",
-    "ELVIN JOHN"
+    "MARYSE",
+    "ALESSANDRO",
+    "DIANE",
+    "KEITH",
+    "NICOLE",
+    "ELVIN"
 )
 DEFAULT_INPUT_DIR = Path("data/splitted/csv")
 DEFAULT_OUTPUT_DIR = Path("data/splitted/person_transactions")
