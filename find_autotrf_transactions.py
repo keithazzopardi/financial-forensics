@@ -20,7 +20,10 @@ TRANSFER_RE = re.compile(
     r"|\bAUTOMATED\s+TRANSFER(?:\s+(?!REF\b)(?P<automated_target>[A-Z0-9]+))?",
     re.IGNORECASE,
 )
-REFERENCE_RE = re.compile(r"\bAUTOMATED\s+TRANSFER\s+REF:\s*([^-]+?)\s*-", re.IGNORECASE)
+REFERENCE_RE = re.compile(
+    r"\bAUTOMATED\s+TRANSFER(?:\s+[A-Z0-9]+)?\s+REF:\s*([^-]+?)\s*-",
+    re.IGNORECASE,
+)
 CHEQUE_WITHDRAWAL_RE = re.compile(r"^\s*CHEQUE\s+WITHDRAWAL\s+000(\d+)\b", re.IGNORECASE)
 
 
@@ -74,6 +77,15 @@ def _transfer_target(match: re.Match[str] | None) -> str:
     return match.group("autotrf_target") or match.group("automated_target") or ""
 
 
+def _rows_match_amount(left: dict[str, str], right: dict[str, str]) -> bool:
+    """Require a known transaction amount to match before linking rows."""
+    left_fields = left.get("_fields", "").split("\x1f")
+    right_fields = right.get("_fields", "").split("\x1f")
+    left_amount = _amount_key(left.get(_column(left_fields, "Amount") or "", ""))
+    right_amount = _amount_key(right.get(_column(right_fields, "Amount") or "", ""))
+    return left_amount is not None and left_amount == right_amount
+
+
 def _read_statement_rows(input_dir: Path) -> list[dict[str, str]]:
     """Read CSV statement rows recursively."""
     all_rows: list[dict[str, str]] = []
@@ -103,13 +115,11 @@ def collect_autotrf_transactions(input_dir: Path, output_path: Path) -> int:
     rows = _read_statement_rows(input_dir)
     transfers = [row for row in rows if _transfer_match(row.get("_description", ""))]
 
-    # Pair generic reference transfers only when reference, transaction date,
+    # Pair reciprocal reference transfers only when reference, transaction date,
     # and amount all agree and there is exactly one row for each of two IBANs.
     groups: dict[tuple[str, date, Decimal], list[int]] = {}
     for index, transfer in enumerate(transfers):
         description = transfer.get("_description", "")
-        if _transfer_target(_transfer_match(description)):
-            continue
         reference = REFERENCE_RE.search(description)
         fields = transfer.get("_fields", "").split("\x1f")
         date_col, amount_col = _column(fields, "Date"), _column(fields, "Amount")
@@ -134,6 +144,13 @@ def collect_autotrf_transactions(input_dir: Path, output_path: Path) -> int:
         left_iban = left.get(left_iban_col or "", "").strip()
         right_iban = right.get(right_iban_col or "", "").strip()
         if not left_iban or not right_iban or left_iban == right_iban:
+            continue
+        left_target = _transfer_target(_transfer_match(left.get("_description", "")))
+        right_target = _transfer_target(_transfer_match(right.get("_description", "")))
+        # When targets are present, make sure the two rows point at each other.
+        # Generic reference rows have no target and retain the existing pairing
+        # behavior based on their distinct IBANs.
+        if (left_target and left_target != right_iban) or (right_target and right_target != left_iban):
             continue
         grouped_target[left_index] = right_iban
         grouped_counterpart[left_index] = right
@@ -167,9 +184,14 @@ def collect_autotrf_transactions(input_dir: Path, output_path: Path) -> int:
     origin_column, target_column = resolved_fields[:2]
     cheque_number_column, source_column = resolved_fields[-2:]
     first_columns = {origin_column, target_column, cheque_number_column}
-    output_fields = [origin_column, target_column, cheque_number_column] + [
+    output_fields = [origin_column, target_column] + [
         field for field in output_fields if field not in first_columns
     ]
+    amount_column = _column(output_fields, "Amount")
+    if amount_column:
+        output_fields.insert(output_fields.index(amount_column) + 1, cheque_number_column)
+    else:
+        output_fields.append(cheque_number_column)
     row_lookup = {
         (row.get("_csv_path", ""), int(row.get("_csv_line", "0"))): row
         for row in rows
@@ -199,7 +221,7 @@ def collect_autotrf_transactions(input_dir: Path, output_path: Path) -> int:
                     if not neighbor:
                         continue
                     cheque = CHEQUE_WITHDRAWAL_RE.match(neighbor.get("_description", ""))
-                    if cheque:
+                    if cheque and _rows_match_amount(related_transfer, neighbor):
                         out[cheque_number_column] = f"Cheque {cheque.group(1)}"
                         break
                 if out.get(cheque_number_column):
