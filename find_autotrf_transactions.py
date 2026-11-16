@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import re
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
@@ -13,11 +14,21 @@ DEFAULT_OUTPUT_PATH = Path("data/splitted/cheques/autotrf_transactions.csv")
 SOURCE_FIELD = "Source CSV file"
 ORIGIN_FIELD = "Origin IBAN"
 TARGET_FIELD = "Targeted IBAN"
+CHEQUE_NUMBER_FIELD = "Cheque Number"
 TRANSFER_RE = re.compile(
     r"\bAUTOTRF\s+(?P<autotrf_target>[A-Z0-9]+)"
     r"|\bAUTOMATED\s+TRANSFER(?:\s+(?!REF\b)(?P<automated_target>[A-Z0-9]+))?",
     re.IGNORECASE,
 )
+REFERENCE_RE = re.compile(r"\bAUTOMATED\s+TRANSFER\s+REF:\s*([^-]+?)\s*-", re.IGNORECASE)
+CHEQUE_WITHDRAWAL_RE = re.compile(r"^\s*CHEQUE\s+WITHDRAWAL\s+000(\d+)\b", re.IGNORECASE)
+
+
+def _amount_key(value: str | None) -> Decimal | None:
+    try:
+        return Decimal((value or "").replace(",", "").strip()).normalize()
+    except InvalidOperation:
+        return None
 
 
 def _date(value: str | None) -> date | None:
@@ -75,10 +86,12 @@ def _read_statement_rows(input_dir: Path) -> list[dict[str, str]]:
                 if not all(required.values()):
                     print(f"Skipping {csv_path}: missing transaction columns")
                     continue
-                for row in reader:
+                for line_number, row in enumerate(reader, start=1):
                     row["_description"] = row.get(required["Description"] or "", "")
                     row["_date"] = row.get(required["Date"] or "", "")
                     row["_fields"] = "\x1f".join(fields)
+                    row["_csv_path"] = str(csv_path)
+                    row["_csv_line"] = str(line_number)
                     all_rows.append(row)
         except (OSError, UnicodeError, csv.Error) as error:
             print(f"Skipping {csv_path}: {error}")
@@ -89,15 +102,60 @@ def collect_autotrf_transactions(input_dir: Path, output_path: Path) -> int:
     """Write automated transfer rows with their original transaction fields."""
     rows = _read_statement_rows(input_dir)
     transfers = [row for row in rows if _transfer_match(row.get("_description", ""))]
-    transfers.sort(key=lambda row: _date(row.get("_date")) or date.min, reverse=True)
+
+    # Pair generic reference transfers only when reference, transaction date,
+    # and amount all agree and there is exactly one row for each of two IBANs.
+    groups: dict[tuple[str, date, Decimal], list[int]] = {}
+    for index, transfer in enumerate(transfers):
+        description = transfer.get("_description", "")
+        if _transfer_target(_transfer_match(description)):
+            continue
+        reference = REFERENCE_RE.search(description)
+        fields = transfer.get("_fields", "").split("\x1f")
+        date_col, amount_col = _column(fields, "Date"), _column(fields, "Amount")
+        transaction_date = _date(transfer.get(date_col or "", ""))
+        amount = _amount_key(transfer.get(amount_col or ""))
+        if not reference or transaction_date is None or amount is None:
+            continue
+        key = (reference.group(1).strip().upper(), transaction_date, amount)
+        groups.setdefault(key, []).append(index)
+
+    grouped_target: dict[int, str] = {}
+    grouped_counterpart: dict[int, dict[str, str]] = {}
+    consumed: set[int] = set()
+    for indices in groups.values():
+        if len(indices) != 2:
+            continue
+        left_index, right_index = indices
+        left, right = transfers[left_index], transfers[right_index]
+        left_fields = left.get("_fields", "").split("\x1f")
+        right_fields = right.get("_fields", "").split("\x1f")
+        left_iban_col, right_iban_col = _column(left_fields, "IBAN"), _column(right_fields, "IBAN")
+        left_iban = left.get(left_iban_col or "", "").strip()
+        right_iban = right.get(right_iban_col or "", "").strip()
+        if not left_iban or not right_iban or left_iban == right_iban:
+            continue
+        grouped_target[left_index] = right_iban
+        grouped_counterpart[left_index] = right
+        consumed.add(right_index)
+
+    output_transfers = [
+        (transfer, grouped_target.get(index), grouped_counterpart.get(index))
+        for index, transfer in enumerate(transfers)
+        if index not in consumed
+    ]
+    output_transfers.sort(
+        key=lambda item: _date(item[0].get("_date")) or date.min,
+        reverse=True,
+    )
 
     output_fields: list[str] = []
-    for row in transfers:
+    for row, _, _ in output_transfers:
         for field in row.get("_fields", "").split("\x1f"):
             if (field and field.strip().casefold() not in {"iban", "start date", "end date"}
                     and field not in output_fields):
                 output_fields.append(field)
-    added_fields = (ORIGIN_FIELD, TARGET_FIELD, SOURCE_FIELD)
+    added_fields = (ORIGIN_FIELD, TARGET_FIELD, CHEQUE_NUMBER_FIELD, SOURCE_FIELD)
     resolved_fields = []
     for field in added_fields:
         name, suffix = field, 2
@@ -107,13 +165,21 @@ def collect_autotrf_transactions(input_dir: Path, output_path: Path) -> int:
         output_fields.append(name)
         resolved_fields.append(name)
     origin_column, target_column = resolved_fields[:2]
-    source_column = resolved_fields[-1]
+    cheque_number_column, source_column = resolved_fields[-2:]
+    first_columns = {origin_column, target_column, cheque_number_column}
+    output_fields = [origin_column, target_column, cheque_number_column] + [
+        field for field in output_fields if field not in first_columns
+    ]
+    row_lookup = {
+        (row.get("_csv_path", ""), int(row.get("_csv_line", "0"))): row
+        for row in rows
+    }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="", encoding="utf-8-sig") as destination:
         writer = csv.DictWriter(destination, fieldnames=output_fields, extrasaction="ignore")
         writer.writeheader()
-        for transfer in transfers:
+        for transfer, paired_target, paired_counterpart in output_transfers:
             fields = transfer.get("_fields", "").split("\x1f")
             desc_col, iban_col = _column(fields, "Description"), _column(fields, "IBAN")
             out = {key: transfer.get(key, "") for key in fields}
@@ -122,12 +188,27 @@ def collect_autotrf_transactions(input_dir: Path, output_path: Path) -> int:
                 out[date_col] = _output_date(transfer.get(date_col, ""))
             out[origin_column] = transfer.get(iban_col or "", "")
             target = _transfer_match(transfer.get(desc_col or "", ""))
-            out[target_column] = _transfer_target(target)
+            out[target_column] = paired_target or _transfer_target(target)
+            for related_transfer in (transfer, paired_counterpart):
+                if not related_transfer:
+                    continue
+                source_path = related_transfer.get("_csv_path", "")
+                source_line = int(related_transfer.get("_csv_line", "0"))
+                for neighbor_line in (source_line - 1, source_line + 1):
+                    neighbor = row_lookup.get((source_path, neighbor_line))
+                    if not neighbor:
+                        continue
+                    cheque = CHEQUE_WITHDRAWAL_RE.match(neighbor.get("_description", ""))
+                    if cheque:
+                        out[cheque_number_column] = f"Cheque {cheque.group(1)}"
+                        break
+                if out.get(cheque_number_column):
+                    break
             out[source_column] = transfer.get("Source file", "")
             writer.writerow(out)
 
-    print(f"Saved {output_path} ({len(transfers)} automated transfer transactions)")
-    return len(transfers)
+    print(f"Saved {output_path} ({len(output_transfers)} automated transfer transactions)")
+    return len(output_transfers)
 
 
 if __name__ == "__main__":
