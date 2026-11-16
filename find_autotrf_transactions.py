@@ -15,6 +15,7 @@ SOURCE_FIELD = "Source CSV file"
 ORIGIN_FIELD = "Origin IBAN"
 TARGET_FIELD = "Targeted IBAN"
 CHEQUE_NUMBER_FIELD = "Cheque Number"
+CHEQUE_AMOUNT_FIELD = "Cheque Amount"
 TRANSFER_RE = re.compile(
     r"\bAUTOTRF\s+(?P<autotrf_target>[A-Z0-9]+)"
     r"|\bAUTOMATED\s+TRANSFER(?:\s+(?!REF\b)(?P<automated_target>[A-Z0-9]+))?",
@@ -24,7 +25,18 @@ REFERENCE_RE = re.compile(
     r"\bAUTOMATED\s+TRANSFER(?:\s+[A-Z0-9]+)?\s+REF:\s*([^-]+?)\s*-",
     re.IGNORECASE,
 )
+REFERENCE_REPAIRS = {
+    "3010SWP2519000NB": "301OSWP2519000NB",
+    "3010SWP2309600JK": "301OSWP2309600JK",
+    "301OSWP202450123": "301OSWP2024501Z3",
+}
+REFERENCE_REPAIR_RE = re.compile(
+    r"\b(?:" + "|".join(REFERENCE_REPAIRS) + r")\b",
+    re.IGNORECASE,
+)
+IBAN_COMPARE_PREFIXES = ("MT36VALL220130000000", "MT88VALL220130000000")
 CHEQUE_WITHDRAWAL_RE = re.compile(r"^\s*CHEQUE\s+WITHDRAWAL\s+000(\d+)\b", re.IGNORECASE)
+CHEQUE_RE = re.compile(r"^\s*CHEQUE\s+(\d+)\b", re.IGNORECASE)
 
 
 def _amount_key(value: str | None) -> Decimal | None:
@@ -77,6 +89,23 @@ def _transfer_target(match: re.Match[str] | None) -> str:
     return match.group("autotrf_target") or match.group("automated_target") or ""
 
 
+def _repair_references(description: str) -> str:
+    """Correct known OCR errors in automated transfer references."""
+    return REFERENCE_REPAIR_RE.sub(
+        lambda match: REFERENCE_REPAIRS[match.group(0).upper()],
+        description,
+    )
+
+
+def _iban_compare_key(value: str) -> str:
+    """Ignore configured account prefixes when comparing IBANs."""
+    normalized = value.strip().upper()
+    for prefix in IBAN_COMPARE_PREFIXES:
+        if normalized.startswith(prefix):
+            return normalized[len(prefix):]
+    return normalized
+
+
 def _rows_match_amount(left: dict[str, str], right: dict[str, str]) -> bool:
     """Require a known transaction amount to match before linking rows."""
     left_fields = left.get("_fields", "").split("\x1f")
@@ -99,7 +128,10 @@ def _read_statement_rows(input_dir: Path) -> list[dict[str, str]]:
                     print(f"Skipping {csv_path}: missing transaction columns")
                     continue
                 for line_number, row in enumerate(reader, start=1):
-                    row["_description"] = row.get(required["Description"] or "", "")
+                    description_column = required["Description"] or ""
+                    description = _repair_references(row.get(description_column, ""))
+                    row[description_column] = description
+                    row["_description"] = description
                     row["_date"] = row.get(required["Date"] or "", "")
                     row["_fields"] = "\x1f".join(fields)
                     row["_csv_path"] = str(csv_path)
@@ -115,9 +147,10 @@ def collect_autotrf_transactions(input_dir: Path, output_path: Path) -> int:
     rows = _read_statement_rows(input_dir)
     transfers = [row for row in rows if _transfer_match(row.get("_description", ""))]
 
-    # Pair reciprocal reference transfers only when reference, transaction date,
-    # and amount all agree and there is exactly one row for each of two IBANs.
+    # Pair reference transfers only when reference, transaction date, and amount
+    # agree and there is exactly one row for each of two IBANs.
     groups: dict[tuple[str, date, Decimal], list[int]] = {}
+    autotrf_groups: dict[tuple[date, Decimal], list[int]] = {}
     for index, transfer in enumerate(transfers):
         description = transfer.get("_description", "")
         reference = REFERENCE_RE.search(description)
@@ -125,10 +158,14 @@ def collect_autotrf_transactions(input_dir: Path, output_path: Path) -> int:
         date_col, amount_col = _column(fields, "Date"), _column(fields, "Amount")
         transaction_date = _date(transfer.get(date_col or "", ""))
         amount = _amount_key(transfer.get(amount_col or ""))
-        if not reference or transaction_date is None or amount is None:
+        if transaction_date is None or amount is None:
             continue
-        key = (reference.group(1).strip().upper(), transaction_date, amount)
-        groups.setdefault(key, []).append(index)
+        if reference:
+            key = (reference.group(1).strip().upper(), transaction_date, amount)
+            groups.setdefault(key, []).append(index)
+        match = _transfer_match(description)
+        if match and match.group("autotrf_target"):
+            autotrf_groups.setdefault((transaction_date, amount), []).append(index)
 
     grouped_target: dict[int, str] = {}
     grouped_counterpart: dict[int, dict[str, str]] = {}
@@ -143,18 +180,76 @@ def collect_autotrf_transactions(input_dir: Path, output_path: Path) -> int:
         left_iban_col, right_iban_col = _column(left_fields, "IBAN"), _column(right_fields, "IBAN")
         left_iban = left.get(left_iban_col or "", "").strip()
         right_iban = right.get(right_iban_col or "", "").strip()
-        if not left_iban or not right_iban or left_iban == right_iban:
+        if (not left_iban or not right_iban
+                or _iban_compare_key(left_iban) == _iban_compare_key(right_iban)):
             continue
         left_target = _transfer_target(_transfer_match(left.get("_description", "")))
         right_target = _transfer_target(_transfer_match(right.get("_description", "")))
         # When targets are present, make sure the two rows point at each other.
         # Generic reference rows have no target and retain the existing pairing
         # behavior based on their distinct IBANs.
-        if (left_target and left_target != right_iban) or (right_target and right_target != left_iban):
+        if ((left_target and _iban_compare_key(left_target) != _iban_compare_key(right_iban))
+                or (right_target and _iban_compare_key(right_target) != _iban_compare_key(left_iban))):
             continue
         grouped_target[left_index] = right_iban
         grouped_counterpart[left_index] = right
         consumed.add(right_index)
+
+    def _iban(row: dict[str, str]) -> str:
+        fields = row.get("_fields", "").split("\x1f")
+        column = _column(fields, "IBAN")
+        return _iban_compare_key(row.get(column or "", ""))
+
+    # AUTOTRF rows have no shared reference to group by. Pair only unambiguous
+    # reciprocal origin/target rows with the same date and exact amount.
+    for indices in autotrf_groups.values():
+        for left_index in indices:
+            if left_index in consumed:
+                continue
+            left = transfers[left_index]
+            left_iban = _iban(left)
+            left_target = _iban_compare_key(
+                _transfer_target(_transfer_match(left.get("_description", "")))
+            )
+            if not left_iban or not left_target:
+                continue
+            candidates = [
+                right_index
+                for right_index in indices
+                if right_index != left_index
+                and right_index not in consumed
+                and _iban(transfers[right_index]) == left_target
+                and _iban_compare_key(_transfer_target(_transfer_match(
+                    transfers[right_index].get("_description", "")
+                ))) == left_iban
+            ]
+            if len(candidates) != 1:
+                continue
+            right_index = candidates[0]
+            # Avoid choosing arbitrarily if duplicate rows make the reverse
+            # match ambiguous.
+            right = transfers[right_index]
+            right_iban = _iban(right)
+            right_target = _iban_compare_key(
+                _transfer_target(_transfer_match(right.get("_description", "")))
+            )
+            reverse_candidates = [
+                candidate_index
+                for candidate_index in indices
+                if candidate_index != right_index
+                and candidate_index not in consumed
+                and _iban(transfers[candidate_index]) == right_target
+                and _iban_compare_key(_transfer_target(_transfer_match(
+                    transfers[candidate_index].get("_description", "")
+                ))) == right_iban
+            ]
+            if len(reverse_candidates) != 1 or reverse_candidates[0] != left_index:
+                continue
+            grouped_target[left_index] = _transfer_target(
+                _transfer_match(left.get("_description", ""))
+            ).strip()
+            grouped_counterpart[left_index] = right
+            consumed.add(right_index)
 
     output_transfers = [
         (transfer, grouped_target.get(index), grouped_counterpart.get(index))
@@ -172,7 +267,13 @@ def collect_autotrf_transactions(input_dir: Path, output_path: Path) -> int:
             if (field and field.strip().casefold() not in {"iban", "start date", "end date"}
                     and field not in output_fields):
                 output_fields.append(field)
-    added_fields = (ORIGIN_FIELD, TARGET_FIELD, CHEQUE_NUMBER_FIELD, SOURCE_FIELD)
+    added_fields = (
+        ORIGIN_FIELD,
+        TARGET_FIELD,
+        CHEQUE_NUMBER_FIELD,
+        CHEQUE_AMOUNT_FIELD,
+        SOURCE_FIELD,
+    )
     resolved_fields = []
     for field in added_fields:
         name, suffix = field, 2
@@ -182,16 +283,25 @@ def collect_autotrf_transactions(input_dir: Path, output_path: Path) -> int:
         output_fields.append(name)
         resolved_fields.append(name)
     origin_column, target_column = resolved_fields[:2]
-    cheque_number_column, source_column = resolved_fields[-2:]
-    first_columns = {origin_column, target_column, cheque_number_column}
+    cheque_number_column, cheque_amount_column, source_column = resolved_fields[2:]
+    first_columns = {
+        origin_column,
+        target_column,
+        cheque_number_column,
+        cheque_amount_column,
+    }
     output_fields = [origin_column, target_column] + [
         field for field in output_fields if field not in first_columns
     ]
     amount_column = _column(output_fields, "Amount")
     if amount_column:
-        output_fields.insert(output_fields.index(amount_column) + 1, cheque_number_column)
+        cheque_index = output_fields.index(amount_column) + 1
+        output_fields[cheque_index:cheque_index] = [
+            cheque_number_column,
+            cheque_amount_column,
+        ]
     else:
-        output_fields.append(cheque_number_column)
+        output_fields.extend([cheque_number_column, cheque_amount_column])
     row_lookup = {
         (row.get("_csv_path", ""), int(row.get("_csv_line", "0"))): row
         for row in rows
@@ -216,6 +326,15 @@ def collect_autotrf_transactions(input_dir: Path, output_path: Path) -> int:
                     continue
                 source_path = related_transfer.get("_csv_path", "")
                 source_line = int(related_transfer.get("_csv_line", "0"))
+                next_transaction = row_lookup.get((source_path, source_line + 1))
+                if next_transaction:
+                    cheque = CHEQUE_RE.match(next_transaction.get("_description", ""))
+                    if cheque:
+                        out[cheque_number_column] = f"Cheque {cheque.group(1)}"
+                        next_fields = next_transaction.get("_fields", "").split("\x1f")
+                        next_amount_column = _column(next_fields, "Amount")
+                        out[cheque_amount_column] = next_transaction.get(next_amount_column or "", "")
+                        break
                 for neighbor_line in (source_line - 1, source_line + 1):
                     neighbor = row_lookup.get((source_path, neighbor_line))
                     if not neighbor:
@@ -223,6 +342,11 @@ def collect_autotrf_transactions(input_dir: Path, output_path: Path) -> int:
                     cheque = CHEQUE_WITHDRAWAL_RE.match(neighbor.get("_description", ""))
                     if cheque and _rows_match_amount(related_transfer, neighbor):
                         out[cheque_number_column] = f"Cheque {cheque.group(1)}"
+                        neighbor_fields = neighbor.get("_fields", "").split("\x1f")
+                        neighbor_amount_column = _column(neighbor_fields, "Amount")
+                        out[cheque_amount_column] = neighbor.get(
+                            neighbor_amount_column or "", ""
+                        )
                         break
                 if out.get(cheque_number_column):
                     break
