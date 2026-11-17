@@ -35,7 +35,10 @@ REFERENCE_REPAIR_RE = re.compile(
     re.IGNORECASE,
 )
 IBAN_COMPARE_PREFIXES = ("MT36VALL220130000000", "MT88VALL220130000000")
-CHEQUE_WITHDRAWAL_RE = re.compile(r"^\s*CHEQUE\s+WITHDRAWAL\s+000(\d+)\b", re.IGNORECASE)
+CHEQUE_WITHDRAWAL_RE = re.compile(
+    r"^\s*CHEQUE\s+WITHDRAWAL\s+(?:000)?(\d+)\b",
+    re.IGNORECASE,
+)
 CHEQUE_RE = re.compile(r"^\s*CHEQUE\s+(\d+)\b", re.IGNORECASE)
 
 
@@ -97,6 +100,10 @@ def _repair_references(description: str) -> str:
     )
 
 
+def _cheque_match(description: str) -> re.Match[str] | None:
+    return CHEQUE_WITHDRAWAL_RE.match(description) or CHEQUE_RE.match(description)
+
+
 def _iban_compare_key(value: str) -> str:
     """Ignore configured account prefixes when comparing IBANs."""
     normalized = value.strip().upper()
@@ -146,6 +153,7 @@ def collect_autotrf_transactions(input_dir: Path, output_path: Path) -> int:
     """Write automated transfer rows with their original transaction fields."""
     rows = _read_statement_rows(input_dir)
     transfers = [row for row in rows if _transfer_match(row.get("_description", ""))]
+    cheque_rows = [row for row in rows if _cheque_match(row.get("_description", ""))]
 
     # Pair reference transfers only when reference, transaction date, and amount
     # agree and there is exactly one row for each of two IBANs.
@@ -267,6 +275,11 @@ def collect_autotrf_transactions(input_dir: Path, output_path: Path) -> int:
             if (field and field.strip().casefold() not in {"iban", "start date", "end date"}
                     and field not in output_fields):
                 output_fields.append(field)
+    for row in cheque_rows:
+        for field in row.get("_fields", "").split("\x1f"):
+            if (field and field.strip().casefold() not in {"iban", "start date", "end date"}
+                    and field not in output_fields):
+                output_fields.append(field)
     added_fields = (
         ORIGIN_FIELD,
         TARGET_FIELD,
@@ -307,54 +320,100 @@ def collect_autotrf_transactions(input_dir: Path, output_path: Path) -> int:
         for row in rows
     }
 
+    mapped_cheques: set[tuple[str, int]] = set()
+    output_rows: list[tuple[date, int, dict[str, str]]] = []
+    row_order = 0
+    for transfer, paired_target, paired_counterpart in output_transfers:
+        fields = transfer.get("_fields", "").split("\x1f")
+        desc_col, iban_col = _column(fields, "Description"), _column(fields, "IBAN")
+        out = {key: transfer.get(key, "") for key in fields}
+        date_col = _column(fields, "Date")
+        if date_col:
+            out[date_col] = _output_date(transfer.get(date_col, ""))
+        out[origin_column] = transfer.get(iban_col or "", "")
+        target = _transfer_match(transfer.get(desc_col or "", ""))
+        out[target_column] = paired_target or _transfer_target(target)
+        for related_transfer in (transfer, paired_counterpart):
+            if not related_transfer:
+                continue
+            source_path = related_transfer.get("_csv_path", "")
+            source_line = int(related_transfer.get("_csv_line", "0"))
+            next_transaction = row_lookup.get((source_path, source_line + 1))
+            if next_transaction:
+                cheque = CHEQUE_RE.match(next_transaction.get("_description", ""))
+                if cheque:
+                    out[cheque_number_column] = f"Cheque {cheque.group(1)}"
+                    mapped_cheques.add((
+                        next_transaction.get("_csv_path", ""),
+                        int(next_transaction.get("_csv_line", "0")),
+                    ))
+                    next_fields = next_transaction.get("_fields", "").split("\x1f")
+                    next_amount_column = _column(next_fields, "Amount")
+                    out[cheque_amount_column] = next_transaction.get(next_amount_column or "", "")
+                    break
+            for neighbor_line in (source_line - 1, source_line + 1):
+                neighbor = row_lookup.get((source_path, neighbor_line))
+                if not neighbor:
+                    continue
+                cheque = CHEQUE_WITHDRAWAL_RE.match(neighbor.get("_description", ""))
+                if cheque and _rows_match_amount(related_transfer, neighbor):
+                    out[cheque_number_column] = f"Cheque {cheque.group(1)}"
+                    mapped_cheques.add((
+                        neighbor.get("_csv_path", ""),
+                        int(neighbor.get("_csv_line", "0")),
+                    ))
+                    neighbor_fields = neighbor.get("_fields", "").split("\x1f")
+                    neighbor_amount_column = _column(neighbor_fields, "Amount")
+                    out[cheque_amount_column] = neighbor.get(
+                        neighbor_amount_column or "", ""
+                    )
+                    break
+            if out.get(cheque_number_column):
+                break
+        out[source_column] = transfer.get("Source file", "")
+        output_rows.append((_date(transfer.get("_date")) or date.min, row_order, out))
+        row_order += 1
+
+    for cheque_row in cheque_rows:
+        cheque_key = (
+            cheque_row.get("_csv_path", ""),
+            int(cheque_row.get("_csv_line", "0")),
+        )
+        if cheque_key in mapped_cheques:
+            continue
+        fields = cheque_row.get("_fields", "").split("\x1f")
+        description_column = _column(fields, "Description")
+        iban_column = _column(fields, "IBAN")
+        amount_column = _column(fields, "Amount")
+        cheque = _cheque_match(cheque_row.get("_description", ""))
+        if not cheque:
+            continue
+        out = {key: cheque_row.get(key, "") for key in fields}
+        if description_column:
+            out[description_column] = "Unmatched"
+        date_column = _column(fields, "Date")
+        if date_column:
+            out[date_column] = _output_date(cheque_row.get(date_column, ""))
+        out[origin_column] = cheque_row.get(iban_column or "", "")
+        out[target_column] = ""
+        out[cheque_number_column] = f"Cheque {cheque.group(1)}"
+        out[cheque_amount_column] = cheque_row.get(amount_column or "", "")
+        out[source_column] = cheque_row.get("Source file", "")
+        output_rows.append((_date(cheque_row.get("_date")) or date.min, row_order, out))
+        row_order += 1
+
+    output_rows.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="", encoding="utf-8-sig") as destination:
         writer = csv.DictWriter(destination, fieldnames=output_fields, extrasaction="ignore")
         writer.writeheader()
-        for transfer, paired_target, paired_counterpart in output_transfers:
-            fields = transfer.get("_fields", "").split("\x1f")
-            desc_col, iban_col = _column(fields, "Description"), _column(fields, "IBAN")
-            out = {key: transfer.get(key, "") for key in fields}
-            date_col = _column(fields, "Date")
-            if date_col:
-                out[date_col] = _output_date(transfer.get(date_col, ""))
-            out[origin_column] = transfer.get(iban_col or "", "")
-            target = _transfer_match(transfer.get(desc_col or "", ""))
-            out[target_column] = paired_target or _transfer_target(target)
-            for related_transfer in (transfer, paired_counterpart):
-                if not related_transfer:
-                    continue
-                source_path = related_transfer.get("_csv_path", "")
-                source_line = int(related_transfer.get("_csv_line", "0"))
-                next_transaction = row_lookup.get((source_path, source_line + 1))
-                if next_transaction:
-                    cheque = CHEQUE_RE.match(next_transaction.get("_description", ""))
-                    if cheque:
-                        out[cheque_number_column] = f"Cheque {cheque.group(1)}"
-                        next_fields = next_transaction.get("_fields", "").split("\x1f")
-                        next_amount_column = _column(next_fields, "Amount")
-                        out[cheque_amount_column] = next_transaction.get(next_amount_column or "", "")
-                        break
-                for neighbor_line in (source_line - 1, source_line + 1):
-                    neighbor = row_lookup.get((source_path, neighbor_line))
-                    if not neighbor:
-                        continue
-                    cheque = CHEQUE_WITHDRAWAL_RE.match(neighbor.get("_description", ""))
-                    if cheque and _rows_match_amount(related_transfer, neighbor):
-                        out[cheque_number_column] = f"Cheque {cheque.group(1)}"
-                        neighbor_fields = neighbor.get("_fields", "").split("\x1f")
-                        neighbor_amount_column = _column(neighbor_fields, "Amount")
-                        out[cheque_amount_column] = neighbor.get(
-                            neighbor_amount_column or "", ""
-                        )
-                        break
-                if out.get(cheque_number_column):
-                    break
-            out[source_column] = transfer.get("Source file", "")
+        for _, _, out in output_rows:
             writer.writerow(out)
 
-    print(f"Saved {output_path} ({len(output_transfers)} automated transfer transactions)")
-    return len(output_transfers)
+    output_record_count = len(output_rows)
+    print(f"Saved {output_path} ({output_record_count} transactions)")
+    return output_record_count
 
 
 if __name__ == "__main__":
