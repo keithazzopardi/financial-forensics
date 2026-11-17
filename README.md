@@ -34,4 +34,27 @@ If `uv` is not on your shell's `PATH`, install it first or use the Python interp
 uv run python main.py
 ```
 
+## Extract cheques to JSON
+
+Put cheque-book PDF files in `data` and run:
+
+```sh
+uv run cheque_to_json.py
+```
+
+The script first saves each source page as a separate PDF under
+`data/cheques/splitted`, then processes those split pages and writes one JSON array per
+page under `data/cheques/json` (named after the split page PDF). Each entry contains
+`ChequeNumber`, numeric `Amount`,
+`Date` in `yyyy-mm-dd`, and `Payable`. The cheque date is taken from below the cheque;
+the date written inside the cheque is ignored. `Payable` is left blank when the model's
+confidence is below 70%. You can provide input and output folders explicitly:
+
+Page splitting is controlled by `SPLIT_PDF_PAGES` in `cheque_to_json.py`. Set it to
+`False` to process source PDFs directly.
+
+```sh
+uv run cheque_to_json.py data/cheques data/cheques/json
+```
+
 If dependencies changed, run `uv sync` from the project directory, then try `uv run main.py` again.
